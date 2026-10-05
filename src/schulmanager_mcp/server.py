@@ -7,6 +7,16 @@ and parent letters via the Schulmanager Online platform.
 
 import json
 import os
+import base64
+import html
+import io
+import re
+import httpx
+import asyncio
+import smtplib
+from pathlib import Path
+from email.message import EmailMessage
+from pypdf import PdfReader
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
@@ -294,7 +304,102 @@ async def get_letters(ctx: Context) -> str:
     except Exception as e:
         return f"Error fetching letters: {e}"
 
+def _send_mail_sync(subject: str, body: str) -> None:
+    sender = os.environ["GMAIL_ADDRESS"]
+    password = os.environ["GMAIL_APP_PASSWORD"]
+    recipients = [a.strip() for a in os.environ.get("SUMMARY_TO", sender).split(",") if a.strip()]
 
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(body)
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
+        smtp.login(sender, password)
+        smtp.send_message(msg)
+
+
+@mcp.tool(name="schulmanager_send_summary_email")
+async def send_summary_email(subject: str, body: str, ctx: Context) -> str:
+    """Send the school summary by email to the parent.
+
+    The recipient is fixed in the server configuration and cannot be changed.
+    Use plain text with simple bullet points ("- ") in the body.
+    """
+    if not os.environ.get("GMAIL_ADDRESS") or not os.environ.get("GMAIL_APP_PASSWORD"):
+        return "Error: GMAIL_ADDRESS and GMAIL_APP_PASSWORD are not configured."
+    try:
+        await asyncio.to_thread(_send_mail_sync, subject, body)
+        return "Email sent."
+    except Exception as e:
+        return f"Error sending email: {e}"
+
+STATE_DIR = Path(__file__).resolve().parents[2] / "state"
+
+
+def _school_key() -> str:
+    return os.environ.get("SCHOOL_KEY", "default")
+
+
+def _state_path() -> Path:
+    return STATE_DIR / f"processed_{_school_key()}.json"
+
+
+def _load_processed() -> set[int]:
+    p = _state_path()
+    if not p.exists():
+        return set()
+    try:
+        return set(json.loads(p.read_text(encoding="utf-8")))
+    except Exception:
+        return set()
+
+
+def _save_processed(ids: set[int]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    p = _state_path()
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(sorted(ids)), encoding="utf-8")
+    tmp.replace(p)
+
+
+@mcp.tool(name="schulmanager_get_new_letters")
+async def get_new_letters(ctx: Context) -> str:
+    """List parent letters that have NOT been processed yet, oldest first.
+
+    Read each one with schulmanager_get_letter. Only after the summary email
+    was sent successfully, call schulmanager_mark_letters_processed with their IDs.
+    """
+    client = _get_client(ctx)
+    try:
+        data = await client.single_call("letters", "get-letters", {})
+    except Exception as e:
+        return f"Error: {e}"
+    letters = data if isinstance(data, list) else (data or {}).get("data", [])
+    processed = _load_processed()
+    new = [l for l in letters if isinstance(l, dict) and l.get("id") not in processed]
+    new.sort(key=lambda l: l.get("sentDate") or "")
+    key = _school_key()
+    if not new:
+        return f"Schule '{key}': keine neuen Briefe."
+    lines = [f"Schule '{key}': {len(new)} neue Briefe (SM-ID-Präfix: {key}-):"]
+    for l in new:
+        lines.append(f"- ID {l.get('id')}: {l.get('title')} (gesendet {l.get('sentDate')})")
+    return "\n".join(lines)
+
+
+@mcp.tool(name="schulmanager_mark_letters_processed")
+async def mark_letters_processed(letter_ids: list[int], ctx: Context) -> str:
+    """Mark letters as processed so schulmanager_get_new_letters no longer returns them.
+
+    Call this only after the summary email was sent successfully.
+    """
+    processed = _load_processed()
+    processed.update(int(i) for i in letter_ids)
+    _save_processed(processed)
+    return f"{len(letter_ids)} Briefe als verarbeitet markiert ({_school_key()})."
+    
 @mcp.tool(
     name="schulmanager_get_institution",
     annotations={
@@ -540,7 +645,7 @@ def _format_daily_report(
 
             actual = lesson.get("actualLesson", {})
             subj = actual.get("subject", {}).get("name") or actual.get("subjectLabel", "?")
-            room = actual.get("room", {}).get("name", "")
+            room = (actual.get("room") or {}).get("name", "")
             teachers = actual.get("teachers", [])
             teacher = teachers[0].get("lastname", "") if teachers else ""
             change = ""
@@ -730,7 +835,88 @@ async def raw_call(module: str, endpoint: str, parameters: str, ctx: Context) ->
     except Exception as e:
         return f"Error: {e}"
 
+SM_BASE_URL = "https://login.schulmanager-online.de"
 
+
+async def _fetch_pdf_text(file_field: str) -> str:
+    token = base64.b64encode(file_field.encode("utf-8")).decode("ascii")
+    url = f"{SM_BASE_URL}/download-file/{token}"
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as http:
+            r = await http.get(url, headers={"Referer": SM_BASE_URL + "/"})
+    except Exception as e:
+        return f"[PDF-Download fehlgeschlagen: {e}]"
+    if r.status_code != 200 or not r.content.startswith(b"%PDF"):
+        return (f"[PDF nicht geladen: HTTP {r.status_code}, "
+                f"{r.headers.get('content-type')}]")
+    try:
+        reader = PdfReader(io.BytesIO(r.content))
+        pages = [(p.extract_text() or "").strip() for p in reader.pages]
+    except Exception as e:
+        return f"[PDF konnte nicht gelesen werden: {e}]"
+    text = "\n\n".join(t for t in pages if t)
+    if not text:
+        return "[PDF ohne Textebene, vermutlich ein Scan]"
+    return text[:30000]
+    
+def _html_to_text(html_str: str) -> str:
+    if not html_str:
+        return ""
+    s = re.sub(r"(?i)<br\s*/?>", "\n", html_str)
+    s = re.sub(r"(?i)</(p|div|li|h[1-6]|tr)>", "\n", s)
+    s = re.sub(r"(?i)<li[^>]*>", "- ", s)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = html.unescape(s)
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n\s*\n+", "\n\n", s)
+    return s.strip()
+
+
+@mcp.tool(name="schulmanager_get_letter")
+async def get_letter(letter_id: int, ctx: Context) -> str:
+    """Get the full content of one parent letter (Elternbrief) by its ID.
+
+    Use the letter IDs returned by schulmanager_get_letters. Returns title,
+    dates, reply deadline, survey options, attachment list and the full text.
+    """
+    client = _get_client(ctx)
+    params = {"action": {
+        "model": "modules/letters/letter",
+        "action": "findByPk",
+        "parameters": [letter_id, {"include": [{
+            "association": "attachments", "required": False,
+            "attributes": ["id", "filename", "file", "contentType", "inline", "letterId"],
+        }]}],
+    }}
+    try:
+        data = await client.single_call("letters", "poqa", params)
+    except Exception as e:
+        return f"Error: {e}"
+
+    if isinstance(data, dict) and "title" not in data and isinstance(data.get("data"), dict):
+        data = data["data"]
+    if not data:
+        return f"Letter {letter_id} not found."
+
+    lines = [f"# {data.get('title', '')}",
+             f"ID: {data.get('id')}",
+             f"Gesendet: {data.get('sentDate')}"]
+    if data.get("answerDeadline"):
+        lines.append(f"Antwortfrist: {data['answerDeadline']}")
+    if data.get("options"):
+        lines.append(f"Optionen/Umfrage: {_format_json(data['options'])}")
+    attachments = data.get("attachments") or []
+    lines.append("")
+    lines.append(_html_to_text(data.get("text", "")))
+    for a in attachments:
+        name, ctype = a.get("filename"), a.get("contentType") or ""
+        lines.append("")
+        lines.append(f"## Anhang: {name}")
+        if ctype == "application/pdf" and a.get("file"):
+            lines.append(await _fetch_pdf_text(a["file"]))
+        else:
+            lines.append(f"[{ctype}, nicht automatisch lesbar]")
+    return "\n".join(lines)
 # ── Entry point ─────────────────────────────────────────────────
 
 
